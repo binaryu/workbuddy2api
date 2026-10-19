@@ -67,6 +67,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
+| 🧩 **Codex / Responses 兼容** | 除 `/v1/chat/completions` 外内置 **`/v1/responses`** 适配层（Responses ↔ Chat Completions 双向翻译，含流式事件序列与工具调用），Codex 0.155+（`wire_api` 只认 `responses`）可直接接入；面板「接入」页给出现成配置片段 |
 | 🌐 **代理池（socks5）** | 批量维护 socks5 代理（每行一条，自动去重/备注/连通性探测）；账号池里可为**每个账号单独指定代理**，或一键配置（按 IP 顺序 / 同一个 IP / 一键清除）；未指定的账号直连，改动即时生效 |
 | 🔓 **TLS 免校验（两档）** | 代理会 MITM 掉 443（报 `x509: certificate has expired / self-signed`）时：① 单条代理点「免校验」（`\|insecure`），只让经它的请求跳过证书校验；② 配置 `upstream.tls_skip_verify` 全局关闭。两者都热生效 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
@@ -168,6 +169,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **代理池（socks5）** | `internal/proxypool` + 面板「代理池」视图：批量增删 socks5 代理、每账号单独指定 / 一键按 IP 顺序分配 / 同一个 IP / 一键清除、连通性探测。出站按账号选路（chat / billing / refresh / 上报全覆盖），未指定的账号直连，改动即时生效（无需重启） |
+| **Responses API 适配（Codex 接入）** | `POST /v1/responses`：Responses ↔ Chat Completions 双向翻译（含流式事件序列、工具调用、usage 口径），复用既有轮转主链路；实测 Codex 0.155 文本与 shell 工具调用全链路通过；面板新增「接入」页给出配置片段与模型列表 |
 | **TLS 免校验（两档）** | 代理 MITM 导致 `x509: certificate has expired / self-signed` 时：单条代理级「免校验」（`internal/upstream/router.go` 双 Transport 分发，只影响经该代理的请求）或全局 `upstream.tls_skip_verify`（热生效） |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
@@ -634,12 +636,12 @@ http://127.0.0.1:7863/panel/
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航八个视图：
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
 
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 积分剩余·总额 / 粘性会话）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
 | **代理池** | 批量添加 socks5 代理（一行一条，支持备注与去重）、代理表（连通性探测 / 免校验 / 删除 / 已分配账号）、一键配置（按 IP 顺序 / 同一个 IP / 一键清除）、账号 → 代理对照表；账号池表格每行也有「代理」按钮可单独指定/清除 |
+| **接入** | 客户端怎么连本网关：Base URL / API Key（按当前访问地址自动推导）、Codex `config.toml` 片段、curl / Python 示例、可用模型列表（点模型名即复制并回填片段），全部一键复制 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
@@ -663,12 +665,6 @@ http://127.0.0.1:7863/panel/
 请求记录表会显示每次调用的来源：IP 取 `X-Forwarded-For` 首段 → `X-Real-IP` → 回落 TCP 对端（直连部署下这是唯一线索）；User-Agent 截断 200 字节入库，stdout 流水行同时追加压缩后的客户端标签（`src=203.0.113.7 ua="Chrome/120.0.0.0"`，浏览器 UA 不会整段铺开）。
 
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
-| **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
-| **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
-| **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
-| **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
-| **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
@@ -695,6 +691,51 @@ http://127.0.0.1:7863/panel/
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 
 > ⚠️ 公网部署提示：服务自身只提供明文 HTTP，**请务必置于 HTTPS 反向代理之后**（Nginx/Caddy 等）并配置访问限流；仅本机或私有网络使用时可直接运行。
+
+## 🧩 接入 Codex（与其它客户端）
+
+### 直接可用的配置（Codex）
+
+Codex 的 `model_providers.<id>.wire_api` **只接受 `responses`**（官方配置参考原文：*"`responses` is the only supported value"*；实测旧值 `chat` 会让 Codex 直接拒绝加载配置：*"`wire_api = "chat"` is no longer supported"*）。本网关已内置 `/v1/responses` 适配层，因此 Codex 可直接接入：
+
+```toml
+# ~/.codex/config.toml
+model = "cn:glm-5.2"          # 或 global:xxx（模型名必须带域前缀，见 /v1/models）
+model_provider = "wb2api"
+model_context_window = 200000
+
+[model_providers.wb2api]
+name = "WorkBuddy2API"
+base_url = "http://127.0.0.1:7863/v1"   # 换成你的监听地址（局域网用本机 IP）
+env_key = "WB2API_KEY"
+wire_api = "responses"
+```
+
+```bash
+export WB2API_KEY=<config.json 里的 api_key>
+codex exec "只回答两个字：你好"     # 自检
+```
+
+保存后 `codex` 即走本网关。面板「**接入**」页会把上面这些按你当前访问的地址生成好，一键复制。
+
+> 注：`model_max_output_tokens` 在当前 Codex 版本不被识别（会提示 ignored）；上下文用 `model_context_window` 声明即可，其余模型元数据可忽略（Codex 会回落到默认元数据，仅有一条提示）。
+
+### 适配层做了什么
+
+`internal/server/responses.go` 把 Responses 请求翻译成 Chat Completions 请求，交给既有 `chatCompletions` 主链路（选号 / 轮转 / 冷却 / 粘性 / SSE 重建 / 用量记录全部复用，不改动那条被真实流量打磨过的路径），再把结果翻译回去：
+
+| 方向 | 映射 |
+|---|---|
+| 请求 | `instructions` → system 消息；`input` 数组项（`message` / `function_call` / `function_call_output`）→ `messages`（连续 `function_call` 合并为一条 assistant 的 `tool_calls`；`function_call_output` → `role=tool`；带 `namespace` 的调用按 `namespace__name` 拍平）；扁平工具 `{type:"function",name,...}` → 嵌套 `{type:"function",function:{...}}`；**命名空间工具** `{type:"namespace",name:"collaboration",tools:[...]}` → 逐条拍平成 `{type:"function"}`（名字 `<namespace>__<tool>`，chat 的 `function.name` 不允许 `.`）；`reasoning.effort` → `reasoning_effort`；`max_output_tokens` → `max_tokens` |
+| 响应 | `output` 项：文本 → `message` + `output_text`；工具调用 → `function_call`（`call_id` / `name` / `arguments` 原样透传，**拍平名还原出 `name` + `namespace` 两个字段**，并补 `encrypted_function_args: []`）；`usage`：`prompt_tokens`/`completion_tokens` → `input_tokens`/`output_tokens`（含 `*_tokens_details`） |
+| 流式 | `response.created` / `response.in_progress` / `output_item.added` / `content_part.added` / `output_text.delta`* / `output_text.done` / `content_part.done` / `output_item.done` / `function_call_arguments.delta`* / `function_call_arguments.done` / `response.completed`，`sequence_number` 严格递增 |
+| 错误 | 上游失败（非 2xx）→ 原状态码 + OpenAI 错误信封原样透出（客户端按 HTTP 错误处理与重试）；流中错误帧 → `response.failed` |
+
+> **多代理（subagents）**：Codex 的多代理工具在 Responses 口径里是**一个** `{"type":"namespace","name":"collaboration","tools":[...]}` 工具包（`spawn_agent` / `send_message` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents`），调用回来时 `function_call` 项带 `"namespace":"collaboration"`。适配层负责拍平（上行）/还原（下行）：缺了它，上游看不到这些工具（`type:"namespace"` 会被当非 function 丢弃），且 Codex 的 router 因缺 `namespace` 按默认命名空间查表失败，直接报 `unsupported call: spawn_agent` —— 表现就是「Codex 不支持 subagents」。
+
+### 其它客户端
+
+任何 OpenAI 兼容客户端（OpenAI SDK / Cherry Studio / ChatBox / Cline 等）把 Base URL 指向 `http://<host>:<port>/v1`、API Key 填 `api_key`、模型名带 `cn:` / `global:` 前缀即可；这类客户端走的是 `/v1/chat/completions`，不需要 Responses 适配层。
 
 ## 🌐 代理池（socks5）
 
@@ -777,6 +818,7 @@ Post "https://www.workbuddy.ai/billing/meter/get-user-resource":
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | **Responses API 适配层**（Codex 等只支持 `wire_api="responses"` 的客户端）：请求/响应双向翻译后复用 chat 主链路（选号 / 轮转 / 冷却 / 粘性 / 用量记录一致）；支持流式事件序列（`response.created` → `output_text.delta` / `function_call_arguments.delta` → `response.completed`）与非流式 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |

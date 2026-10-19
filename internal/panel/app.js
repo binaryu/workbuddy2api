@@ -18,6 +18,11 @@ let reqRangeState = null; // 请求记录的时间范围（用量页的见 trang
 // 当前账号。声明在顶层（与 view/overviewData 同处）：go('#proxies') 在脚本顶层就会
 // 触发 loadProxies()，若这两个变量声明在文件后半段，异步回调前若发生同步访问即 TDZ。
 let proxyData = null, proxyUID = null;
+// 接入页状态：epModelsLoaded 防重复拉取；epExampleModel 记录用户点过「复制」的模型名，
+// 用于把示例片段里的模型换成它。同样必须声明在顶层——go('#endpoint') 会在脚本顶层
+// 同步触发 loadEndpoint() → renderEndpoint()，声明在文件后半段即 TDZ 崩溃
+//（frontend_test 的 #endpoint 冒烟就是抓这个的）。
+let epModelsLoaded = false, epExampleModel = '';
 
 const $ = id => document.getElementById(id);
 
@@ -342,13 +347,14 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', proxies: '代理池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', proxies: '代理池', endpoint: '接入', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'proxies') loadProxies();
+  if (v === 'endpoint') loadEndpoint();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
@@ -946,8 +952,120 @@ $('btnProxySave').onclick = async () => {
 };
 $('btnProxyClose').onclick = () => { $('proxyVeil').classList.remove('on'); proxyUID = null; };
 
+/* ── 接入（客户端怎么连） ─────────────────────────────────────────── */
 /* 面板只读地"告诉客户端怎么连"：Base URL 按当前访问地址推导（本地访问给 127.0.0.1，
    局域网访问给局域网 IP），密钥取当前登录用的那把，模型列表直连同源 /v1/models。 */
+function epKey() { return localStorage.getItem(LS_KEY) || ''; }
+
+function epBaseURL() {
+  // location.origin 已含协议+主机+端口（含局域网 IP 场景），拼 /v1 即 OpenAI 兼容 base。
+  return location.origin + '/v1';
+}
+
+function epCodexToml(model) {
+  const key = epKey() || '<你的 api_key>';
+  return [
+    'model = "' + (model || 'cn:glm-5.2') + '"',
+    'model_provider = "wb2api"',
+    'model_context_window = 200000',
+    '',
+    '[model_providers.wb2api]',
+    'name = "WorkBuddy2API"',
+    'base_url = "' + epBaseURL() + '"',
+    'env_key = "WB2API_KEY"',
+    'wire_api = "responses"',
+    '',
+    '# 启动前：export WB2API_KEY=' + key,
+  ].join('\n');
+}
+
+function epCurlText(model) {
+  return 'curl ' + epBaseURL() + '/chat/completions \\\n' +
+    '  -H "Authorization: Bearer ' + (epKey() || '<api_key>') + '" \\\n' +
+    '  -H "Content-Type: application/json" \\\n' +
+    '  -d \'{"model":"' + (model || 'cn:glm-5.2') + '","messages":[{"role":"user","content":"你好"}],"stream":true}\'';
+}
+
+function epPyText(model) {
+  return 'from openai import OpenAI\n\n' +
+    'client = OpenAI(base_url="' + epBaseURL() + '", api_key="' + (epKey() || '<api_key>') + '")\n\n' +
+    'resp = client.chat.completions.create(\n' +
+    '    model="' + (model || 'cn:glm-5.2') + '",\n' +
+    '    messages=[{"role": "user", "content": "你好"}],\n' +
+    ')';
+}
+
+function renderEndpoint(model) {
+  const key = epKey();
+  $('epBase').value = epBaseURL();
+  $('epKey').value = key || '（未启用鉴权）';
+  $('epCodex').textContent = epCodexToml(model);
+  $('epCurl').textContent = epCurlText(model);
+  $('epPy').textContent = epPyText(model);
+  const lan = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
+  $('epNote').textContent = lan
+    ? '本机访问 · 局域网设备请用 http://<本机IP>:' + location.port + '/v1'
+    : '局域网访问 · Codex 与本网关同机时可用 http://127.0.0.1:' + location.port + '/v1';
+}
+
+async function loadEndpointModels() {
+  const tb = $('epModels');
+  tb.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="state"><span class="dots">正在拉取模型列表</span></div></div></td></tr>';
+  try {
+    const h = {};
+    if (epKey()) h['Authorization'] = 'Bearer ' + epKey();
+    const r = await fetch(location.origin + '/v1/models', { headers: h });
+    const d = await r.json().catch(() => ({}));
+    const list = d.data || [];
+    epModelsLoaded = true;
+    $('epModelsNote').textContent = list.length ? list.length + ' 个模型（上游实时目录，缓存 10 分钟）' : '上游未返回模型（账号不可用或探测失败）';
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">没有可用模型</div>先在「账号池」添加账号</div></td></tr>';
+      return;
+    }
+    tb.innerHTML = list.map(m => {
+      const ctx = m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—';
+      const cr = m.credits ? esc(String(m.credits)) : (m.description ? '' : '—');
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="mid" title="' + esc(m.description || m.name || '') + '">' + esc(m.id) + '</td>' +
+        '<td class="num">' + ctx + '</td>' +
+        '<td class="num">' + cr + '</td>' +
+        '<td class="acts"><button class="xs ghost" data-model="' + esc(m.id) + '">复制</button></td>' +
+        '</tr>';
+    }).join('');
+    // 首行模型作为示例填进片段（保持已填值不被刷新覆盖：只在未手动选过时更新）
+    tb.querySelectorAll('button[data-model]').forEach(b => b.onclick = async () => {
+      const id = b.dataset.model;
+      try { await copyText(id); toast('已复制模型名：' + id, 'ok'); } catch (e) { toast('复制失败', 'err'); }
+      renderEndpoint(id);
+    });
+    if (!epExampleModel) renderEndpoint(list[0].id);
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="5"><div class="state err">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+function loadEndpoint() {
+  renderEndpoint(epExampleModel);
+  if (!epModelsLoaded) loadEndpointModels();
+}
+
+$('btnEpModels').onclick = loadEndpointModels;
+$('btnEpCopyToml').onclick = async () => {
+  try { await copyText($('epCodex').textContent); toast('已复制 config.toml 片段', 'ok'); }
+  catch (e) { toast('复制失败，请手动选择', 'err'); }
+};
+$('btnEpCodex').onclick = $('btnEpCopyToml').onclick;
+$('btnEpCurl').onclick = async () => {
+  try { await copyText($('epCurl').textContent); toast('已复制 curl 示例', 'ok'); }
+  catch (e) { toast('复制失败，请手动选择', 'err'); }
+};
+$('btnEpPy').onclick = async () => {
+  try { await copyText($('epPy').textContent); toast('已复制 Python 示例', 'ok'); }
+  catch (e) { toast('复制失败，请手动选择', 'err'); }
+};
+
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
    /panel/api/model_probes 只读透传。探测键带域前缀（cn:glm-5.2），模型表
