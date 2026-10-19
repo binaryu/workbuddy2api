@@ -14,6 +14,10 @@ let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
+// 代理池视图状态：proxyData 为最近一次 /proxies 快照，proxyUID 为「指定代理」对话框
+// 当前账号。声明在顶层（与 view/overviewData 同处）：go('#proxies') 在脚本顶层就会
+// 触发 loadProxies()，若这两个变量声明在文件后半段，异步回调前若发生同步访问即 TDZ。
+let proxyData = null, proxyUID = null;
 
 const $ = id => document.getElementById(id);
 
@@ -338,12 +342,13 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', proxies: '代理池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  if (v === 'proxies') loadProxies();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
@@ -370,7 +375,7 @@ setTimeout(() => {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -434,6 +439,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
+      '<td class="pxcell">' + proxyTag(s.proxy) + '</td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
@@ -444,6 +450,10 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        '<button class="xs ghost" data-a="proxy" data-u="' + esc(s.uid) + '">代理</button>' +
+        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
+        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
@@ -548,6 +558,9 @@ $('accBody').addEventListener('click', async ev => {
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'proxy') {
+      openProxy(u);
+      return; // 打开对话框不改动池状态，无需重载总览
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -573,6 +586,368 @@ $('btnActivityAll').onclick = async () => {
   catch (e) { toast(e.message, 'err'); }
 };
 
+/* ── 代理池 ───────────────────────────────────────────────────────── */
+/* 代理池是「账号 → socks5 代理」的稀疏映射：没指定的账号直连。面板侧只做展示与
+   增删改，出站选路在网关侧按 uid 查表（upstream.Client.ProxyFor），保存即生效。 */
+// proxyShort 去掉 scheme 与口令，只留 host:port（表格里显示用）。
+function proxyShort(addr) {
+  if (!addr) return '';
+  let s = String(addr).replace(/^socks5h?:\/\//i, '');
+  const at = s.lastIndexOf('@');
+  if (at >= 0) s = s.slice(at + 1);
+  return s;
+}
+
+// proxyMasked 展示用地址：口令替换为 ***（面板列表里不直接铺口令，悬停 title 看完整值）。
+function proxyMasked(addr) {
+  return String(addr || '').replace(/^(socks5h?:\/\/)([^:@\/]+):[^@\/]*@/i, '$1$2:***@');
+}
+
+// pxChecked 是否探测过：后端省略零值时间，空串即从未探测。
+function pxChecked(px) { return !!(px.last_check && !String(px.last_check).startsWith('0001-')); }
+
+// proxyTag 账号表「代理」列：直连 = 灰标签，已指定 = 绿标签 + host:port（悬停看完整地址）。
+function proxyTag(addr) {
+  if (!addr) return '<span class="tag mute">直连</span>';
+  return '<span class="tag ok" title="' + esc(addr) + '">' + esc(proxyShort(addr)) + '</span>';
+}
+
+function renderProxies(d) {
+  proxyData = d;
+  const proxies = d.proxies || [], accounts = d.accounts || [];
+  const assigned = accounts.filter(a => a.proxy).length;
+  const healthy = proxies.filter(p => pxChecked(p) && p.ok).length;
+  $('pxTotal').textContent = proxies.length;
+  $('pxHealthy').textContent = healthy;
+  $('pxDead').textContent = d.dead || 0;
+  $('pxAssigned').textContent = assigned;
+  $('pxDirect').textContent = accounts.length - assigned;
+  $('pxAccts').textContent = accounts.length;
+  $('pxNote').textContent = (d.path ? d.path + ' · ' : '') + proxies.length + ' 条代理 · ' + assigned + ' 个账号已指定'
+    + (d.dead ? ' · ' + d.dead + ' 条失效' : '');
+  // 阈值输入框：仅在用户没在编辑时同步（避免把正在输入的值刷掉）。
+  const th = $('pxThreshold');
+  if (th && document.activeElement !== th) th.value = d.threshold || 3;
+  $('pxHealthNote').textContent = '连续失败阈值 ' + (d.threshold || 3) + ' 次 · 达阈值自动换一条「没用过的」代理并记录失效；无可用替代则解绑回直连';
+
+  // 代理列表
+  const tb = $('pxBody');
+  if (!proxies.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">还没有代理</div>把 socks5 代理粘贴到上方「批量添加」，一行一条</div></td></tr>';
+  } else {
+    tb.innerHTML = proxies.map(px => {
+      const checked = pxChecked(px);
+      let st;
+      if (!checked) st = '<span class="tag mute">未探测</span>';
+      else if (px.ok) st = '<span class="tag ok">可用 ' + (px.latency_ms || 0) + 'ms</span>';
+      else st = '<span class="tag bad" title="' + esc(px.last_err || '') + '">不通</span>';
+      const stTime = checked ? '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:3px">' + ago(px.last_check) + '</div>' : '';
+      // 失败 / 失效列：失效 = 连续失败达阈值自动标记或人工标记（含原因与时间）。
+      const fails = px.fail_count || 0;
+      let failCell;
+      if (px.dead) {
+        failCell = '<span class="tag bad" title="' + esc(px.dead_reason || '连续失败') + '">失效</span>'
+          + (px.dead_at ? '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:3px">' + ago(px.dead_at) + '</div>' : '');
+      } else if (fails) {
+        failCell = '<span class="tag warn" title="累计失败 ' + fails + ' 次">失败 ' + fails + '</span>';
+      } else {
+        failCell = '<span style="color:var(--ink-3)">—</span>';
+      }
+      const accts = (px.accounts || []);
+      const accTxt = accts.length
+        ? '<span title="' + esc(accts.join('\n')) + '">' + accts.length + ' 个</span>'
+        : '<span style="color:var(--ink-3)">未分配</span>';
+      return '<tr class="' + (checked ? (px.ok ? '' : 'off') : '') + '">' +
+        '<td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="addr" title="' + esc(px.addr) + '">' + esc(proxyMasked(px.addr)) + '</td>' +
+        '<td>' + (px.label ? esc(px.label) : '<span style="color:var(--ink-3)">—</span>') +
+          (px.skip_verify ? ' <span class="tag warn" title="经该代理的请求不校验证书（MITM 型代理）">免校验</span>' : '') + '</td>' +
+        '<td>' + st + stTime + '</td>' +
+        '<td>' + failCell + '</td>' +
+        '<td class="accts">' + accTxt + '</td>' +
+        '<td class="acts">' +
+          '<button class="xs ghost" data-a="px-check" data-addr="' + esc(px.addr) + '">测试</button>' +
+          '<button class="xs ghost" data-a="px-skip" data-addr="' + esc(px.addr) + '" data-skip="' + (px.skip_verify ? '0' : '1') + '" title="' +
+            (px.skip_verify ? '恢复严格校验' : '该代理会 MITM 掉 443（证书报错）时打开：只让经它的请求免校验') + '">' +
+            (px.skip_verify ? '恢复校验' : '免校验') + '</button>' +
+          (px.dead
+            ? '<button class="xs ghost" data-a="px-revive" data-addr="' + esc(px.addr) + '" title="取消失效标记，重新参与自动换代理">复活</button>'
+            : '<button class="xs ghost" data-a="px-dead" data-addr="' + esc(px.addr) + '" title="人工标记失效：不再参与自动换代理，可被一键清除">标记失效</button>') +
+          '<button class="xs ghost danger" data-a="px-remove" data-addr="' + esc(px.addr) + '">删除</button>' +
+        '</td></tr>';
+    }).join('');
+  }
+
+  // 同一个 IP 的下拉
+  const sel = $('pxSameAddr');
+  const cur = sel.value;
+  sel.innerHTML = proxies.map(px =>
+    '<option value="' + esc(px.addr) + '">' + esc((px.label ? px.label + ' · ' : '') + proxyShort(px.addr)) + '</option>').join('')
+    || '<option value="">（代理池为空）</option>';
+  if (cur) sel.value = cur;
+  syncPxMode();
+
+  // 账号 → 代理
+  const ab = $('pxAccBody');
+  if (!accounts.length) {
+    ab.innerHTML = '<tr><td colspan="5"><div class="empty"><div class="big">账号池是空的</div>先到「账号池」添加账号</div></td></tr>';
+  } else {
+    ab.innerHTML = accounts.map(a => {
+      const name = (a.nickname ? esc(a.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+      const short = a.uid.length > 16 ? a.uid.slice(0, 16) + '…' : a.uid;
+      const fc = a.fail_count || 0;
+      const failCell = fc
+        ? '<span class="tag warn" title="' + esc(a.fail_err || '') + '">' + fc + ' / 阈值 ' + (d.threshold || 3) + '</span>' +
+          (a.fail_addr ? '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:3px">' + esc(proxyShort(a.fail_addr)) + '</div>' : '')
+        : '<span style="color:var(--ink-3)">—</span>';
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="who" title="' + esc(a.uid) + '"><div class="nm">' + name + (a.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+        '<td>' + proxyTag(a.proxy) + (a.label ? ' <span class="note">' + esc(a.label) + '</span>' : '') +
+          (a.skip_verify ? ' <span class="tag warn">免校验</span>' : '') + '</td>' +
+        '<td>' + failCell + '</td>' +
+        '<td class="acts">' +
+          '<button class="xs ghost" data-a="px-set" data-u="' + esc(a.uid) + '">指定</button>' +
+          (a.proxy ? '<button class="xs ghost danger" data-a="px-unset" data-u="' + esc(a.uid) + '">清除</button>' : '') +
+          (fc ? '<button class="xs ghost" data-a="px-resetfail" data-u="' + esc(a.uid) + '" title="清零该账号的连续失败计数">重置失败</button>' : '') +
+        '</td></tr>';
+    }).join('');
+  }
+}
+
+async function loadProxies() {
+  try { renderProxies(await api('proxies')); }
+  catch (e) { toast(e.message, 'err'); }
+}
+
+$('btnPxReload').onclick = loadProxies;
+
+// syncPxMode 随「配置方式」联动：同一个 IP 时才需要选代理；一键清除与作用范围无关
+// （清除的对象就是"全部已分配的账号"），把作用范围置灰避免误解。
+function syncPxMode() {
+  const mode = $('pxMode').value;
+  $('pxSameWrap').style.opacity = mode === 'same' ? '1' : '.45';
+  const only = $('pxOnly');
+  only.disabled = mode === 'clear';
+  only.style.opacity = mode === 'clear' ? '.45' : '1';
+}
+$('pxMode').onchange = syncPxMode;
+
+$('btnPxAdd').onclick = async () => {
+  const text = $('pxText').value.trim();
+  if (!text) { toast('请先粘贴代理（一行一条）', 'err'); return; }
+  const b = $('btnPxAdd');
+  b.disabled = true; b.textContent = '添加中…';
+  try {
+    const r = await api('proxies/add', { method: 'POST', body: JSON.stringify({ text }) });
+    let msg = '新增 ' + r.added + ' 条';
+    if ((r.dupe || []).length) msg += '，重复 ' + r.dupe.length + ' 条';
+    if ((r.invalid || []).length) msg += '，无法解析 ' + r.invalid.length + ' 行';
+    $('pxAddNote').textContent = msg + ' · 池内共 ' + r.total + ' 条';
+    if ((r.invalid || []).length) $('pxAddNote').textContent += '（' + r.invalid.slice(0, 3).join(' / ') + '）';
+    if (r.save_error) toast('落盘失败：' + r.save_error, 'err');
+    else toast(msg, 'ok');
+    if (r.added) $('pxText').value = '';
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '添加到代理池'; }
+};
+
+$('btnPxCheckAll').onclick = async () => {
+  const b = $('btnPxCheckAll');
+  b.disabled = true; b.textContent = '测试中…';
+  try {
+    const r = await api('proxies/check', { method: 'POST', body: JSON.stringify({}) });
+    toast('连通性测试完成：' + r.healthy + ' / ' + (r.results || []).length + ' 可用', r.healthy ? 'ok' : 'err');
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '全部测试连通性'; }
+};
+
+$('btnPxClear').onclick = async () => {
+  if (!confirm('清空代理池：删除全部代理，并解绑所有账号（账号恢复直连）。确认继续？')) return;
+  const b = $('btnPxClear');
+  b.disabled = true;
+  try {
+    const r = await api('proxies/clear', { method: 'POST' });
+    toast('已清空 ' + r.removed + ' 条代理', 'ok');
+    await loadProxies(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+
+// ── 失效与自愈：阈值 / 一键清除过期代理 / 一键免校验 / 清除失败记录 ──────────
+$('btnPxSaveThreshold').onclick = async () => {
+  const n = parseInt($('pxThreshold').value, 10);
+  if (!(n >= 1 && n <= 1000)) { toast('阈值需在 1..1000 之间', 'err'); return; }
+  const b = $('btnPxSaveThreshold');
+  b.disabled = true;
+  try {
+    const r = await api('proxies/threshold', { method: 'POST', body: JSON.stringify({ n }) });
+    $('pxHealthMsg').textContent = '阈值已保存：连续失败 ' + r.threshold + ' 次自动换代理';
+    toast('阈值已保存：' + r.threshold + ' 次', 'ok');
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+
+// pxPurge/skipAll 共用：范围选择 → 请求 → 提示 + 刷新。
+async function pxHealthAction(kind) {
+  const onlyDead = $('pxSkipScope').value === '1';
+  const includeFailed = $('pxPurgeScope').value === '1';
+  const msg = kind === 'purge'
+    ? '清除「' + (includeFailed ? '失效 + 最近探测不通' : '仅失效') + '」的代理？指向它们的账号会解绑回直连。'
+    : (kind === 'skip' ? '给「' + (onlyDead ? '失效代理' : '全部代理') + '」打开免 TLS 证书校验？' : '给「' + (onlyDead ? '失效代理' : '全部代理') + '」恢复严格证书校验？');
+  if (!confirm(msg + ' 确认执行？')) return;
+  const btn = kind === 'purge' ? $('btnPxPurge') : (kind === 'skip' ? $('btnPxSkipAll') : $('btnPxSkipOff'));
+  btn.disabled = true;
+  try {
+    if (kind === 'purge') {
+      const r = await api('proxies/purge', { method: 'POST', body: JSON.stringify({ include_failed_check: includeFailed }) });
+      const t = '已清除 ' + r.removed + ' 条过期代理' + (r.unbound ? '，解绑 ' + r.unbound + ' 个账号' : '') + '（剩余 ' + r.kept + ' 条）';
+      $('pxHealthMsg').textContent = t; toast(t, r.removed ? 'ok' : 'err');
+    } else {
+      const skip = kind === 'skip';
+      const r = await api('proxies/skipverify_all', { method: 'POST', body: JSON.stringify({ skip, only_dead: onlyDead }) });
+      const t = (skip ? '已对 ' : '已恢复 ') + r.changed + ' 条代理' + (skip ? '免 TLS 校验' : '严格校验');
+      $('pxHealthMsg').textContent = t; toast(t, r.changed ? 'ok' : 'err');
+    }
+    await loadProxies(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; }
+}
+$('btnPxPurge').onclick = () => pxHealthAction('purge');
+$('btnPxSkipAll').onclick = () => pxHealthAction('skip');
+$('btnPxSkipOff').onclick = () => pxHealthAction('unskip');
+
+$('btnPxResetFail').onclick = async () => {
+  if (!confirm('清除全部账号的连续失败记录？失效标记（代理的 Dead 状态）不受影响。')) return;
+  const b = $('btnPxResetFail');
+  b.disabled = true;
+  try {
+    const r = await api('proxies/reset_fail', { method: 'POST', body: JSON.stringify({}) });
+    toast('已清除 ' + r.cleared + ' 条失败记录', 'ok');
+    $('pxHealthMsg').textContent = '已清除 ' + r.cleared + ' 条失败记录';
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+
+$('btnPxBulk').onclick = async () => {
+  const mode = $('pxMode').value;
+  const addr = $('pxSameAddr').value;
+  // 一键清除与「作用范围」无关：清除的就是全部已分配账号。
+  const only = mode === 'clear' ? false : $('pxOnly').value === '1';
+  if (mode === 'same' && !addr) { toast('请先添加代理', 'err'); return; }
+  const desc = mode === 'order' ? '按 IP 顺序给全部账号分配代理'
+    : mode === 'same' ? '把 ' + proxyShort(addr) + ' 分配给' + (only ? '未分配账号' : '全部账号')
+    : '清除全部账号的代理分配（代理列表保留）';
+  if (!confirm(desc + '。确认执行？')) return;
+  const b = $('btnPxBulk');
+  b.disabled = true; b.textContent = '执行中…';
+  try {
+    const r = await api('proxies/bulk', { method: 'POST', body: JSON.stringify({ mode, addr, only_unassigned: only }) });
+    const msg = mode === 'clear' ? '已清除 ' + r.cleared + ' 个账号的分配'
+      : '已配置 ' + r.assigned + ' 个账号' + (r.skipped ? '（跳过 ' + r.skipped + ' 个已有分配）' : '');
+    $('pxBulkNote').textContent = msg;
+    toast(msg, 'ok');
+    await loadProxies(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '执行一键配置'; }
+};
+
+$('pxBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (!b) return;
+  const addr = b.dataset.addr, a = b.dataset.a;
+  if (a === 'px-remove' && !confirm('删除代理 ' + proxyShort(addr) + '？指向它的账号会同时解绑（恢复直连）。')) return;
+  b.disabled = true;
+  try {
+    if (a === 'px-check') {
+      b.textContent = '测试中…';
+      const r = await api('proxies/check', { method: 'POST', body: JSON.stringify({ addrs: [addr] }) });
+      const res = (r.results || [])[0] || {};
+      toast(res.ok ? '可用（' + (res.latency_ms || 0) + 'ms）' : '不通：' + (res.error || '未知错误'), res.ok ? 'ok' : 'err');
+    } else if (a === 'px-remove') {
+      const r = await api('proxies/remove', { method: 'POST', body: JSON.stringify({ addr }) });
+      toast('已删除代理' + (r.unbound ? '，并解绑 ' + r.unbound + ' 个账号' : ''), 'ok');
+    } else if (a === 'px-skip') {
+      const skip = b.dataset.skip === '1';
+      await api('proxies/skipverify', { method: 'POST', body: JSON.stringify({ addr, skip }) });
+      toast(skip ? '已对该代理关闭 TLS 证书校验（仅经它的请求）' : '已恢复严格证书校验', 'ok');
+    } else if (a === 'px-dead') {
+      await api('proxies/dead', { method: 'POST', body: JSON.stringify({ addr, dead: true, reason: '人工标记' }) });
+      toast('已标记失效：不再参与自动换代理，可被「一键清除过期代理」清掉', 'ok');
+    } else if (a === 'px-revive') {
+      await api('proxies/dead', { method: 'POST', body: JSON.stringify({ addr, dead: false }) });
+      toast('已复活该代理（重新参与自动换代理）', 'ok');
+    }
+    await loadProxies(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+});
+
+$('pxAccBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (!b) return;
+  const u = b.dataset.u, a = b.dataset.a;
+  if (a === 'px-set') { openProxy(u); return; }
+  b.disabled = true;
+  try {
+    if (a === 'px-resetfail') {
+      const r = await api('proxies/reset_fail', { method: 'POST', body: JSON.stringify({ uid: u }) });
+      toast(r.cleared ? '已清零该账号的连续失败计数' : '该账号没有失败记录', 'ok');
+    } else {
+      await api('proxies/unassign', { method: 'POST', body: JSON.stringify({ uid: u }) });
+      toast('已清除该账号的代理（恢复直连）', 'ok');
+    }
+    await loadProxies(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+});
+
+// openProxy 打开「指定代理」对话框：下拉列出代理池全部代理 + 「直连」项。
+async function openProxy(uid) {
+  proxyUID = uid;
+  $('proxyWho').textContent = uid;
+  $('proxyVeil').classList.add('on');
+  const sel = $('proxyPick');
+  sel.innerHTML = '<option value="">（直连 · 不使用代理）</option>';
+  try {
+    const d = await api('proxies');
+    proxyData = d;
+    for (const px of (d.proxies || [])) {
+      const o = document.createElement('option');
+      o.value = px.addr;
+      o.textContent = (px.label ? px.label + ' · ' : '') + proxyShort(px.addr) +
+        (pxChecked(px) && !px.ok ? '（上次探测不通）' : '');
+      sel.appendChild(o);
+    }
+    const cur = (d.accounts || []).find(x => x.uid === uid);
+    sel.value = (cur && cur.proxy) || '';
+    if (!(d.proxies || []).length) toast('代理池为空，请先到「代理池」批量添加', 'err');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+$('btnProxySave').onclick = async () => {
+  if (!proxyUID) return;
+  const addr = $('proxyPick').value;
+  const b = $('btnProxySave');
+  b.disabled = true;
+  try {
+    await api('proxies/assign', { method: 'POST', body: JSON.stringify({ uid: proxyUID, addr }) });
+    toast(addr ? '已指定代理：' + proxyShort(addr) : '已清除代理（直连）', 'ok');
+    $('proxyVeil').classList.remove('on');
+    proxyUID = null;
+    await loadOverview(true);
+    if (view === 'proxies') loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; }
+};
+$('btnProxyClose').onclick = () => { $('proxyVeil').classList.remove('on'); proxyUID = null; };
+
+/* 面板只读地"告诉客户端怎么连"：Base URL 按当前访问地址推导（本地访问给 127.0.0.1，
+   局域网访问给局域网 IP），密钥取当前登录用的那把，模型列表直连同源 /v1/models。 */
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
    /panel/api/model_probes 只读透传。探测键带域前缀（cn:glm-5.2），模型表
@@ -989,6 +1364,7 @@ const CFG_MAP = {
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
+  tls_skip_verify: ['upstream', 'tls_skip_verify'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
